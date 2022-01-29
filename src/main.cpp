@@ -34,7 +34,7 @@ UINT64 GetTime() {
 //================================
 
 UINT64 easing_dialog_last_closed_time = 0;
-UINT64 EASING_DIALOG_COOL_TIME = 2000000; // 0.1s
+UINT64 EASING_DIALOG_COOL_TIME = 2000000; // 0.2s
 
 
 // ƒCƒxƒ“ƒgˆ—‚ÉŠ„‚èž‚Ý

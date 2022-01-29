@@ -1,0 +1,4 @@
+LIBRARY easing_quick_setup.auf
+
+EXPORTS
+	GetFilterTable @1

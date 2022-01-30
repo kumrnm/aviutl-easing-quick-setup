@@ -28,6 +28,11 @@ UINT64 GetTime() {
 	return ((UINT64)(ft.dwHighDateTime) << 32) | (UINT64)(ft.dwLowDateTime);
 }
 
+struct {
+	BOOL auto_popup;
+	BOOL move_cursor;
+} config;
+
 
 //================================
 //  拡張編集の内部処理への干渉
@@ -35,11 +40,12 @@ UINT64 GetTime() {
 
 UINT64 easing_dialog_last_closed_time = 0;
 UINT64 EASING_DIALOG_COOL_TIME = 2000000; // 0.2s
+POINT menu_position;
 
 
-// イベント処理に割り込み
+// イベントハンドラをフック
 
-BOOL(*exedit_WndProc_original)(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* editp, void* fp);
+BOOL(*exedit_WndProc_original)(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* editp, void* fp) = nullptr;
 using exedit_WndProc_t = decltype(exedit_WndProc_original);
 BOOL exedit_WndProc_hooked(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* editp, void* fp) {
 	const auto res = exedit_WndProc_original(hwnd, message, wparam, lparam, editp, fp);
@@ -49,8 +55,17 @@ BOOL exedit_WndProc_hooked(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
 		const int trackbar_id = lparam - 0x80000;
 		if (0 <= trackbar_id && trackbar_id < auls::EXEDIT_OBJECT::MAX_TRACK) {
 			if (GetTime() - easing_dialog_last_closed_time > EASING_DIALOG_COOL_TIME) { // クールタイムを設けないと無限ループになる
+
+				// カーソルをボタン上に移動
+				if (config.move_cursor) {
+					SetCursorPos(menu_position.x, menu_position.y);
+				}
+
 				// イージングパラメータ設定ダイアログを表示
-				SendMessage(auls::ObjDlg_GetWindow(hwnd), WM_COMMAND, 0x462, trackbar_id);
+				if (config.auto_popup) {
+					SendMessage(auls::ObjDlg_GetWindow(hwnd), WM_COMMAND, 0x462, trackbar_id);
+				}
+
 			}
 		}
 	}
@@ -59,9 +74,9 @@ BOOL exedit_WndProc_hooked(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
 }
 
 
-// 各種ダイアログ表示処理に割り込み
+// ダイアログ表示処理をフック
 
-INT_PTR(WINAPI* DialogBoxParamA_original)(_In_opt_ HINSTANCE hInstance, _In_ LPCSTR lpTemplateName, _In_opt_ HWND hWndParent, _In_opt_ DLGPROC lpDialogFunc, _In_ LPARAM dwInitParam);
+INT_PTR(WINAPI* DialogBoxParamA_original)(_In_opt_ HINSTANCE hInstance, _In_ LPCSTR lpTemplateName, _In_opt_ HWND hWndParent, _In_opt_ DLGPROC lpDialogFunc, _In_ LPARAM dwInitParam) = nullptr;
 using DialogBoxParamA_t = decltype(DialogBoxParamA_original);
 INT_PTR WINAPI DialogBoxParamA_hooked(_In_opt_ HINSTANCE hInstance, _In_ LPCSTR lpTemplateName, _In_opt_ HWND hWndParent, _In_opt_ DLGPROC lpDialogFunc, _In_ LPARAM dwInitParam) {
 	const auto res = DialogBoxParamA_original(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam);
@@ -75,6 +90,19 @@ INT_PTR WINAPI DialogBoxParamA_hooked(_In_opt_ HINSTANCE hInstance, _In_ LPCSTR 
 };
 
 
+// ポップアップメニュー表示処理をフック
+
+BOOL (WINAPI* TrackPopupMenu_original)(_In_ HMENU hMenu, _In_ UINT uFlags, _In_ int x, _In_ int y, _Reserved_ int nReserved, _In_ HWND hWnd, _Reserved_ CONST RECT* prcRect) = nullptr;
+using TrackPopupMenu_t = decltype(TrackPopupMenu_original);
+BOOL WINAPI TrackPopupMenu_hooked(_In_ HMENU hMenu, _In_ UINT uFlags, _In_ int x, _In_ int y, _Reserved_ int nReserved, _In_ HWND hWnd, _Reserved_ CONST RECT* prcRect) {
+	// 表示位置（クリック位置）を記録する
+	menu_position.x = x;
+	menu_position.y = y;
+
+	return TrackPopupMenu_original(hMenu, uFlags, x, y, nReserved, hWnd, prcRect);
+}
+
+
 
 //================================
 //  初期化処理
@@ -86,10 +114,29 @@ BOOL func_init(FILTER* fp) {
 		show_error(TEXT("拡張編集が見つかりませんでした。"));
 	}
 	else {
+		// コンフィグ
+		const int CONFIG_UNDEFINED = -0x3777;
+#define LoadConfig(name, default_value) \
+	config.name = fp->exfunc->ini_load_int(fp, (LPSTR)#name, CONFIG_UNDEFINED); \
+	if (config.name == CONFIG_UNDEFINED) { \
+		config.name = default_value; \
+		fp->exfunc->ini_save_int(fp, (LPSTR)#name, config.name); \
+	}
+
+		LoadConfig(auto_popup, 1)
+		LoadConfig(move_cursor, 0)
+#undef LoadConfig
+
+
+		// 各種フック
+
 		char exedit_path[1024] = {};
 		GetModuleFileName(exedit->dll_hinst, exedit_path, sizeof(exedit_path));
+
 		DialogBoxParamA_original = (DialogBoxParamA_t)yulib::RewriteFunction(exedit_path, "DialogBoxParamA", DialogBoxParamA_hooked);
-		if (DialogBoxParamA_original == nullptr) {
+		TrackPopupMenu_original = (TrackPopupMenu_t)yulib::RewriteFunction(exedit_path, "TrackPopupMenu", TrackPopupMenu_hooked);
+
+		if (DialogBoxParamA_original == nullptr || TrackPopupMenu_original == nullptr) {
 			show_error("初期化に失敗しました。");
 		}
 		else {

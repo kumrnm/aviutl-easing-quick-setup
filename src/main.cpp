@@ -4,28 +4,20 @@
 #include "auls/aulslib/exedit.h"
 #include "auls/yulib/extra.h"
 
+#define PLUGIN_NAME "イージング設定時短プラグイン"
+#define PLUGIN_VERSION "v1.1.0"
+#define PLUGIN_DEVELOPER "蝙蝠の目"
+
 #ifdef _DEBUG
+#define PLUGIN_VERSION_SUFFIX " (Debug)"
 #include "dbgstream/dbgstream.h"
-#endif
-
-
-#define PLUGIN_NAME TEXT("イージング設定時短プラグイン")
-#ifdef _DEBUG
-#define PLUGIN_NAME_SUFFIX TEXT("（Debug）")
 #else
-#define PLUGIN_NAME_SUFFIX TEXT("")
+#define PLUGIN_VERSION_SUFFIX ""
 #endif
-#define PLUGIN_VERSION TEXT("1.0.1")
 
 
 void show_error(LPCTSTR text) {
 	MessageBox(NULL, text, PLUGIN_NAME, MB_OK | MB_ICONERROR);
-}
-
-UINT64 GetTime() {
-	FILETIME ft;
-	GetSystemTimeAsFileTime(&ft);
-	return ((UINT64)(ft.dwHighDateTime) << 32) | (UINT64)(ft.dwLowDateTime);
 }
 
 struct {
@@ -38,24 +30,62 @@ struct {
 //  拡張編集の内部処理への干渉
 //================================
 
+HHOOK hhooks[2];
+HWND hwnd_exedit, hwnd_objDlg;
 POINT menu_position;
+bool dialogShortcutLocked = true;
 
 
-// イベントハンドラをフック
+// WndProcのフック
 
-BOOL(*exedit_WndProc_original)(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* editp, void* fp) = nullptr;
-using exedit_WndProc_t = decltype(exedit_WndProc_original);
-BOOL exedit_WndProc_hooked(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void* editp, void* fp) {
-	const auto res = exedit_WndProc_original(hwnd, message, wparam, lparam, editp, fp);
+LRESULT CALLBACK HookProc_WndProc(int nCode, WPARAM wParam, LPARAM lParam) {
+	auto info = reinterpret_cast<PCWPSTRUCT>(lParam);
 
-	// イージング設定の変更を捕捉
-	if (message == WM_COMMAND && wparam == 1003 /* OBJECT_DIALOG_MENU */) {
-		const int trackbar_id = lparam - 0x80000;
-		if (0 <= trackbar_id && trackbar_id < auls::EXEDIT_OBJECT::MAX_TRACK) {
+	if (info->hwnd == hwnd_exedit) {
 
-			// 無限ループ対策
-			static bool in_this_procedure = false;
-			if (!in_this_procedure) {
+		if (info->message == WM_FILTER_EXIT) {
+			// フック解除
+			if (hhooks[0]) UnhookWindowsHookEx(hhooks[0]);
+			if (hhooks[1]) UnhookWindowsHookEx(hhooks[1]);
+		}
+
+	}
+	else if (info->hwnd == hwnd_objDlg) {
+
+		if (info->message == WM_COMMAND && 4000 <= info->wParam && info->wParam < 4000 + auls::EXEDIT_OBJECT::MAX_TRACK) {
+			// イージングボタンクリック時
+			if (GetKeyState(VK_MENU) < 0) {
+				dialogShortcutLocked = true;
+			}
+			else {
+				dialogShortcutLocked = false;
+			}
+		} else if (info->message == WM_COMMAND && info->wParam == 0x462) {
+			// イージングパラメータ設定ダイアログ出現時（Altクリック時は何故か反応しない）
+			dialogShortcutLocked = true;
+		}
+
+	}
+
+	return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK HookProc_WndProcRet(int nCode, WPARAM wParam, LPARAM lParam) {
+	auto info = reinterpret_cast<PCWPRETSTRUCT>(lParam);
+
+	if (info->hwnd == hwnd_exedit) {
+
+		if (info->message == WM_FILTER_INIT) {
+			
+			// オブジェクト設定ウィンドウを取得
+			hwnd_objDlg = auls::ObjDlg_GetWindow(hwnd_exedit);
+
+		}
+		else if (info->message == WM_COMMAND && info->wParam == 1003) {
+
+			// イージング変更時
+			const int trackbar_id = info->lParam - 0x80000;
+			if (0 <= trackbar_id && trackbar_id < auls::EXEDIT_OBJECT::MAX_TRACK && !dialogShortcutLocked) {
 
 				// カーソルをボタン上に移動
 				if (config.move_cursor) {
@@ -64,17 +94,16 @@ BOOL exedit_WndProc_hooked(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
 
 				// イージングパラメータ設定ダイアログを表示
 				if (config.auto_popup) {
-					in_this_procedure = true;
-					SendMessage(auls::ObjDlg_GetWindow(hwnd), WM_COMMAND, 0x462, trackbar_id);
-					in_this_procedure = false;
+					SendMessage(auls::ObjDlg_GetWindow(hwnd_exedit), WM_COMMAND, 0x462, trackbar_id);
 				}
 
 			}
 
 		}
+
 	}
 
-	return res;
+	return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
 
@@ -102,6 +131,8 @@ BOOL func_init(FILTER* fp) {
 		show_error(TEXT("拡張編集が見つかりませんでした。"));
 	}
 	else {
+		hwnd_exedit = exedit->hwnd;
+
 		// コンフィグ
 		const int CONFIG_UNDEFINED = -0x3777;
 #define LoadConfig(name, default_value) \
@@ -115,8 +146,10 @@ BOOL func_init(FILTER* fp) {
 		LoadConfig(move_cursor, 0)
 #undef LoadConfig
 
-
 		// 各種フック
+
+		hhooks[0] = SetWindowsHookEx(WH_CALLWNDPROC, HookProc_WndProc, NULL, GetCurrentThreadId());
+		hhooks[1] = SetWindowsHookEx(WH_CALLWNDPROCRET, HookProc_WndProcRet, NULL, GetCurrentThreadId());
 
 		char exedit_path[1024] = {};
 		GetModuleFileName(exedit->dll_hinst, exedit_path, sizeof(exedit_path));
@@ -124,9 +157,6 @@ BOOL func_init(FILTER* fp) {
 		if (config.move_cursor) {
 			TrackPopupMenu_original = (TrackPopupMenu_t)yulib::RewriteFunction(exedit_path, "TrackPopupMenu", TrackPopupMenu_hooked);
 		}
-
-		exedit_WndProc_original = exedit->func_WndProc;
-		exedit->func_WndProc = exedit_WndProc_hooked;
 	}
 
 	return TRUE;
@@ -141,7 +171,7 @@ FILTER_DLL filter = {
 	.flag = FILTER_FLAG_ALWAYS_ACTIVE | FILTER_FLAG_NO_CONFIG | FILTER_FLAG_EX_INFORMATION,
 	.name = (TCHAR*)PLUGIN_NAME,
 	.func_init = func_init,
-	.information = (TCHAR*)(PLUGIN_NAME PLUGIN_NAME_SUFFIX TEXT(" v") PLUGIN_VERSION)
+	.information = (TCHAR*)(PLUGIN_NAME " " PLUGIN_VERSION PLUGIN_VERSION_SUFFIX " by " PLUGIN_DEVELOPER)
 };
 
 EXTERN_C __declspec(dllexport) FILTER_DLL* __stdcall GetFilterTable(void) {
